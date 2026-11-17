@@ -360,8 +360,11 @@ nonisolated enum NetworkDiagnostician {
         }
 
         // ログイン画面（キャプティブポータル）は認証前の通信をまとめて遮断するため、ルーターや
-        // インターネットへの確認も失敗する。検出できた場合はそちらを原因として優先する。
-        let captivePortal = stages[index(.web)].flags.contains(.captivePortal)
+        // インターネットへの確認も失敗する。ログイン画面に置き換えられた確かな根拠（別ホストへの転送や
+        // 書き換えられた本文。HTTPProbe.classifyCaptivePortalResponse を参照）がある場合だけ、そちらを原因として優先する。
+        // 通信の失敗やサーバーエラーではこのフラグは付かないので、ルーター・インターネット・DNS の失敗がそのまま原因になる。
+        let web = stages[index(.web)]
+        let captivePortal = web.status == .failed && web.flags.contains(.captivePortal)
 
         let failed: DiagnosticStage = if captivePortal {
             .web

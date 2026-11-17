@@ -41,8 +41,8 @@ nonisolated struct Outage: Identifiable, Sendable, Codable, Hashable {
     var end: Date?
     var stage: DiagnosticStage
     var failedChecks: Int
-    /// 実際に計測できた停止時間。スリープ中やアプリが動いていなかった時間は
-    /// `StatisticsSummary.maximumSampleGap` までしか数えないため、`end - start` より短くなることがある。
+    /// 実際に計測できた停止時間。スリープ中やアプリが動いていなかった時間は数えない
+    /// （`StatisticsSummary.observedSpan` を参照）ため、`end - start` より短くなることがある。
     var downtime: TimeInterval = 0
 
     var id: Date { start }
@@ -111,11 +111,24 @@ nonisolated struct StatisticsSummary: Sendable {
     var totalDowntime: TimeInterval { outages.reduce(0) { $0 + $1.downtime } }
     var longestOutage: Outage? { outages.max { $0.downtime < $1.downtime } }
 
-    /// アプリが動いていなかった時間（スリープ中・終了中）を稼働・停止のどちらにも数えないための上限。
-    /// 障害の停止時間（NetworkMonitor の復旧ログ・通知）もこの上限で同じように数える。
+    /// 1 回のチェックが代表する時間の上限。監視の中断が記録されていない空白（以前のバージョンの記録など）を
+    /// 稼働・停止のどちらにも数えすぎないための安全策。
     static let maximumSampleGap: TimeInterval = 15 * 60
 
-    static func compute(samples: [CheckSample], period: StatisticsPeriod, now: Date, calendar: Calendar = .current) -> StatisticsSummary {
+    /// `start` に行ったチェックの結果が代表する時間（次のチェック `next` まで）。
+    /// その間に監視が中断された（スリープ・アプリの終了）場合は、中断した時刻までしか数えない。
+    /// 統計（`compute`）と障害中の停止時間の積算（`OutageTracker`）の両方がこの規則を使う。
+    /// - Parameter monitoringPausedAt: `start` の後、次のチェックまでの間に監視が中断された時刻（中断がなければ nil）
+    static func observedSpan(from start: Date, to next: Date, monitoringPausedAt: Date?) -> TimeInterval {
+        var end = next
+        if let monitoringPausedAt, monitoringPausedAt < end { end = monitoringPausedAt }
+        return min(max(0, end.timeIntervalSince(start)), maximumSampleGap)
+    }
+
+    /// - Parameter monitoringPausedSince: 現在監視が中断されている場合、その開始時刻
+    ///   （最後のチェックから `now` までのうち、中断以降の時間を数えないために使う）
+    static func compute(samples: [CheckSample], period: StatisticsPeriod, now: Date,
+                        monitoringPausedSince: Date? = nil, calendar: Calendar = .current) -> StatisticsSummary {
         var summary = StatisticsSummary(period: period, rangeStart: period.startDate(relativeTo: now), rangeEnd: now)
         summary.firstSample = samples.first?.timestamp
         summary.checkCount = samples.count
@@ -127,8 +140,13 @@ nonisolated struct StatisticsSummary: Sendable {
         var currentOutage: Outage?
 
         for (index, sample) in samples.enumerated() {
-            let next = index + 1 < samples.count ? samples[index + 1].timestamp : now
-            let span = min(max(0, next.timeIntervalSince(sample.timestamp)), maximumSampleGap)
+            // 次のチェックの記録には、それまでに監視が中断された時刻が残っている
+            let next = index + 1 < samples.count ? samples[index + 1] : nil
+            let span = if let next {
+                observedSpan(from: sample.timestamp, to: next.timestamp, monitoringPausedAt: next.monitoringPausedAt)
+            } else {
+                observedSpan(from: sample.timestamp, to: now, monitoringPausedAt: monitoringPausedSince)
+            }
             let bucketStart = calendar.dateInterval(of: period.bucketComponent, for: sample.timestamp)?.start ?? sample.timestamp
             var bucket = bucketMap[bucketStart] ?? StatisticsBucket(start: bucketStart)
             var lists = latencyLists[bucketStart] ?? ([], [], [], [])

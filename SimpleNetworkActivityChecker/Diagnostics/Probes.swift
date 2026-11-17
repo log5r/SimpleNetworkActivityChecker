@@ -353,9 +353,12 @@ nonisolated enum HTTPOutcome: Sendable {
     case failed(code: URLError.Code?, message: String)
 }
 
-nonisolated enum CaptivePortalOutcome: Sendable {
+nonisolated enum CaptivePortalOutcome: Sendable, Equatable {
+    /// 想定どおりの応答が返った
     case notCaptive
+    /// 応答がログイン画面などに置き換えられた（確かな根拠がある場合だけ）
     case captive(redirect: String?)
+    /// 通信の失敗・不完全な応答・サーバーエラーなど、判定できなかった
     case failed(String)
 }
 
@@ -405,10 +408,12 @@ nonisolated enum HTTPProbe {
         }
     }
 
+    static let captivePortalHost = "captive.apple.com"
+
     /// 暗号化しない HTTP で captive.apple.com にアクセスし、応答が書き換えられていないかを確認する。
     /// ATS の制約を受けないよう Network.framework で直接 HTTP リクエストを送る。
     static func captivePortalCheck(timeout: TimeInterval = 5) async -> CaptivePortalOutcome {
-        let host = "captive.apple.com"
+        let host = captivePortalHost
         let connection = NWConnection(host: NWEndpoint.Host(host), port: 80, using: .tcp)
         let queue = DispatchQueue(label: "probe.captive")
         let request = Data("GET /hotspot-detect.html HTTP/1.1\r\nHost: \(host)\r\nUser-Agent: CaptiveNetworkSupport\r\nConnection: close\r\n\r\n".utf8)
@@ -417,17 +422,9 @@ nonisolated enum HTTPProbe {
         return await withCheckedContinuation { continuation in
             let once = OnceResumer(continuation)
 
-            @Sendable func evaluate() {
-                let text = String(decoding: buffer.withLock { $0 }, as: UTF8.self)
-                guard !text.isEmpty else { once.resume(.failed("応答がありません")); return }
-                if text.contains("<BODY>Success</BODY>") || text.contains("Success") {
-                    once.resume(.notCaptive)
-                } else {
-                    let location = text.components(separatedBy: "\r\n")
-                        .first { $0.lowercased().hasPrefix("location:") }
-                        .map { $0.dropFirst("location:".count).trimmingCharacters(in: .whitespaces) }
-                    once.resume(.captive(redirect: location))
-                }
+            @Sendable func evaluate(connectionClosed: Bool) {
+                let data = buffer.withLock { $0 }
+                once.resume(classifyCaptivePortalResponse(data, connectionClosed: connectionClosed, probeHost: host))
             }
 
             @Sendable func receive() {
@@ -435,7 +432,8 @@ nonisolated enum HTTPProbe {
                     if let data { buffer.withLock { $0.append(data) } }
                     let size = buffer.withLock { $0.count }
                     if isComplete || error != nil || size > 256_000 {
-                        evaluate()
+                        // エラーで切れた場合は、応答が最後まで届いたかを Content-Length などで判断する
+                        evaluate(connectionClosed: isComplete && error == nil)
                         connection.cancel()
                     } else {
                         receive()
@@ -460,10 +458,100 @@ nonisolated enum HTTPProbe {
                 if buffer.withLock({ $0.isEmpty }) {
                     once.resume(.failed("タイムアウトしました"))
                 } else {
-                    evaluate()
+                    evaluate(connectionClosed: false)
                 }
                 connection.cancel()
             }
+        }
+    }
+
+    /// captive.apple.com への HTTP 応答を判定する。
+    ///
+    /// ログイン画面（キャプティブポータル）と判定するのは、最後まで受信できた応答が
+    /// 別のホストへの転送（3xx）、HTTP 511（ネットワーク認証が必要）、または期待した本文ではない 200 の場合だけ。
+    /// 通信の失敗・途中で切れた応答・サーバーエラー（5xx）やその他の状態コードは、判定できなかった（`.failed`）とする。
+    /// - Parameters:
+    ///   - data: 受信したバイト列（ステータス行・ヘッダー・本文）
+    ///   - connectionClosed: 相手が正常に接続を閉じたか（Content-Length も chunked もない応答の終わりの判断に使う）
+    ///   - probeHost: 問い合わせ先のホスト名（同じホストへの転送はログイン画面の根拠にしない）
+    static func classifyCaptivePortalResponse(_ data: Data, connectionClosed: Bool,
+                                              probeHost: String = captivePortalHost) -> CaptivePortalOutcome {
+        guard !data.isEmpty else { return .failed("応答がありません") }
+        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else {
+            return .failed("応答が途中で途切れました（ヘッダーが不完全です）")
+        }
+
+        let headerLines = String(decoding: data[data.startIndex..<headerEnd.lowerBound], as: UTF8.self)
+            .components(separatedBy: "\r\n")
+        // ステータス行: "HTTP/1.1 200 OK"
+        let statusParts = headerLines[0].split(separator: " ", maxSplits: 2)
+        guard statusParts.count >= 2, statusParts[0].hasPrefix("HTTP/"),
+              statusParts[1].count == 3, let statusCode = Int(statusParts[1]) else {
+            return .failed("HTTP の応答として解釈できません")
+        }
+        var headers: [String: String] = [:]
+        for line in headerLines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            headers[name] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        }
+
+        guard let body = completeBody(data[headerEnd.upperBound...], statusCode: statusCode,
+                                      headers: headers, connectionClosed: connectionClosed) else {
+            return .failed("応答が途中で途切れました（HTTP \(statusCode)）")
+        }
+
+        switch statusCode {
+        case 200:
+            return String(decoding: body, as: UTF8.self).contains("Success") ? .notCaptive : .captive(redirect: nil)
+        case 511:
+            return .captive(redirect: nil)
+        case 300...399:
+            guard let location = headers["location"], !location.isEmpty else {
+                return .failed("転送先のない応答です（HTTP \(statusCode)）")
+            }
+            // 相対パスや同じホストへの転送は、ログイン画面に置き換えられた根拠にならない
+            guard let host = URL(string: location)?.host(), host.lowercased() != probeHost.lowercased() else {
+                return .failed("想定外の転送です（HTTP \(statusCode)）")
+            }
+            return .captive(redirect: location)
+        default:
+            return .failed("想定外の応答です（HTTP \(statusCode)）")
+        }
+    }
+
+    /// 応答の本文を最後まで受信できていれば本文を、途中で切れていれば nil を返す。
+    private static func completeBody(_ raw: Data, statusCode: Int, headers: [String: String], connectionClosed: Bool) -> Data? {
+        // 本文を持たない応答
+        if statusCode == 204 || statusCode == 304 || (100...199).contains(statusCode) { return Data() }
+        if let encoding = headers["transfer-encoding"], encoding.lowercased().contains("chunked") {
+            return decodeChunked(raw)
+        }
+        if let lengthText = headers["content-length"] {
+            guard let length = Int(lengthText), length >= 0, raw.count >= length else { return nil }
+            return Data(raw.prefix(length))
+        }
+        // 長さの指定がない応答は、相手が接続を閉じたところで終わる
+        return connectionClosed ? Data(raw) : nil
+    }
+
+    /// chunked 形式の本文を復号する。最後のチャンク（サイズ 0）まで届いていなければ nil を返す。
+    private static func decodeChunked(_ raw: Data) -> Data? {
+        let crlf = Data("\r\n".utf8)
+        var body = Data()
+        var index = raw.startIndex
+        while true {
+            guard let lineEnd = raw.range(of: crlf, in: index..<raw.endIndex) else { return nil }
+            let sizeText = String(decoding: raw[index..<lineEnd.lowerBound], as: UTF8.self)
+                .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first
+                .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+            guard let size = Int(sizeText, radix: 16), size >= 0, size <= raw.count else { return nil }
+            index = lineEnd.upperBound
+            if size == 0 { return body }
+            guard raw.distance(from: index, to: raw.endIndex) >= size + crlf.count else { return nil }
+            let chunkEnd = raw.index(index, offsetBy: size)
+            body.append(raw[index..<chunkEnd])
+            index = raw.index(chunkEnd, offsetBy: crlf.count)
         }
     }
 }

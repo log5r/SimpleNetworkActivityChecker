@@ -88,12 +88,15 @@ struct StatisticsView: View {
         let period = period
         let now = Date()
         let container = monitor.container
+        // スリープ解除直後など、まだ次のチェックを記録していない中断の時間は数えない
+        let pausedSince = monitor.monitoringPausedAt
         // メインスレッドを塞がないよう、別スレッドのコンテキストで読み込んで集計する
         let work = Task.detached(priority: .userInitiated) {
             let store = DataStore(modelContainer: container)
             let samples = try await store.samples(from: period.startDate(relativeTo: now), to: now)
             try Task.checkCancellation()
-            return (samples, StatisticsSummary.compute(samples: samples, period: period, now: now))
+            return (samples, StatisticsSummary.compute(samples: samples, period: period, now: now,
+                                                        monitoringPausedSince: pausedSince))
         }
         do {
             // 画面の再読み込みでこのタスクがキャンセルされたら、読み込み処理にも伝えて重複して動かないようにする

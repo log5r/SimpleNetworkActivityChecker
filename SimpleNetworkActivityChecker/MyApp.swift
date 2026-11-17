@@ -13,9 +13,12 @@ struct MyApp: App {
     @State private var monitor: NetworkMonitor
     private let container: ModelContainer
 
+    /// 単体テストのホストとして起動されたか。その場合は実際の記録に触れないよう、メモリ上のストアを使い監視も始めない。
+    private static let isHostingUnitTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+
     init() {
         AppSettings.registerDefaults()
-        let (container, error) = Self.makeContainer()
+        let (container, error) = Self.makeContainer(inMemory: Self.isHostingUnitTests)
         self.container = container
         let monitor = NetworkMonitor(container: container)
         if let error {
@@ -23,7 +26,9 @@ struct MyApp: App {
         }
         _monitor = State(initialValue: monitor)
         // ウインドウの有無にかかわらず起動直後から監視を始める
-        Task { @MainActor in monitor.start() }
+        if !Self.isHostingUnitTests {
+            Task { @MainActor in monitor.start() }
+        }
     }
 
     var body: some Scene {
@@ -55,10 +60,11 @@ struct MyApp: App {
         .menuBarExtraStyle(.window)
     }
 
-    private static func makeContainer() -> (ModelContainer, Error?) {
+    private static func makeContainer(inMemory: Bool) -> (ModelContainer, Error?) {
         let schema = Schema([CheckRecord.self, ErrorLogEntry.self])
         do {
-            return (try ModelContainer(for: schema, configurations: ModelConfiguration(schema: schema)), nil)
+            let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: inMemory)
+            return (try ModelContainer(for: schema, configurations: configuration), nil)
         } catch {
             Logger(subsystem: Bundle.main.bundleIdentifier ?? "App", category: "Storage")
                 .error("Failed to open store: \(error.localizedDescription, privacy: .public)")
