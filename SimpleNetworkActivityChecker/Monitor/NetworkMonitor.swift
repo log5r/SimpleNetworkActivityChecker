@@ -10,8 +10,10 @@ import UserNotifications
 final class NetworkMonitor {
     private(set) var latestReport: DiagnosticReport?
     private(set) var isChecking = false
+    /// 進行中の障害の状態（停止時間の積算を含む）
+    private var outage = OutageTracker()
     /// 現在の障害の開始時刻（障害中でなければ nil）
-    private(set) var outageStart: Date?
+    var outageStart: Date? { outage.start }
     /// 記録が追加・削除されるたびに増える（統計画面の再読み込みに使用）
     private(set) var dataVersion = 0
     /// 保存などで発生したエラー（ユーザーに表示する）
@@ -25,11 +27,9 @@ final class NetworkMonitor {
     @ObservationIgnored private var lastPathSignature: String?
     @ObservationIgnored private var pathIsExpensive = false
     @ObservationIgnored private var pathIsConstrained = false
-    @ObservationIgnored private var outageStage: DiagnosticStage?
-    /// 現在の障害で実際に計測できた停止時間（統計と同じく、チェック間隔が空いた分は上限までしか数えない）
-    @ObservationIgnored private var outageDowntime: TimeInterval = 0
-    /// 現在の障害中に最後に記録したチェックの時刻
-    @ObservationIgnored private var outageLastCheck: Date?
+    /// 最後に記録したチェックの後で監視が中断された（スリープ・アプリの終了）時刻。次の記録に残して、
+    /// 中断していた時間を統計や停止時間に数えないようにする。異常終了に備えて UserDefaults にも保存する。
+    @ObservationIgnored private(set) var monitoringPausedAt: Date?
     @ObservationIgnored private var lastPrune: Date?
     @ObservationIgnored private var pruneTask: Task<Void, Error>?
     @ObservationIgnored private var isPruning = false
@@ -42,21 +42,26 @@ final class NetworkMonitor {
     /// チェック中にネットワークが切り替わったため、終了後にもう一度確認する必要があるか
     @ObservationIgnored private var needsRecheckAfterNetworkChange = false
     @ObservationIgnored private var workspaceObservers: [NSObjectProtocol] = []
+    @ObservationIgnored private var appObservers: [NSObjectProtocol] = []
 
     private static let outageStartKey = "currentOutageStart"
     private static let outageStageKey = "currentOutageStage"
     private static let outageDowntimeKey = "currentOutageDowntime"
     private static let outageLastCheckKey = "currentOutageLastCheck"
+    private static let monitoringPausedAtKey = "monitoringPausedAt"
 
     init(container: ModelContainer) {
         self.container = container
         let defaults = UserDefaults.standard
         if let start = defaults.object(forKey: Self.outageStartKey) as? Date {
-            outageStart = start
-            outageStage = defaults.string(forKey: Self.outageStageKey).flatMap(DiagnosticStage.init(rawValue:))
-            outageDowntime = defaults.double(forKey: Self.outageDowntimeKey)
-            outageLastCheck = defaults.object(forKey: Self.outageLastCheckKey) as? Date ?? start
+            outage = OutageTracker(
+                start: start,
+                stage: defaults.string(forKey: Self.outageStageKey).flatMap(DiagnosticStage.init(rawValue:)),
+                downtime: defaults.double(forKey: Self.outageDowntimeKey),
+                lastCheck: defaults.object(forKey: Self.outageLastCheckKey) as? Date ?? start
+            )
         }
+        monitoringPausedAt = defaults.object(forKey: Self.monitoringPausedAtKey) as? Date
     }
 
     private var context: ModelContext { container.mainContext }
@@ -69,6 +74,12 @@ final class NetworkMonitor {
     func start() {
         guard !started else { return }
         started = true
+
+        if monitoringPausedAt == nil {
+            // 前回の終了時刻が分からない（異常終了や以前のバージョンからの更新）場合は、最後の記録の時点から
+            // 監視していなかったものとして扱い、起動までの空白を稼働・停止のどちらにも数えない
+            setMonitoringPaused(at: latestRecordTimestamp())
+        }
 
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
@@ -88,6 +99,9 @@ final class NetworkMonitor {
         workspaceObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.handleDidWake() }
         })
+        appObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pauseMonitoring() }
+        })
 
         if AppSettings.notificationsEnabled {
             requestNotificationAuthorization()
@@ -104,6 +118,9 @@ final class NetworkMonitor {
         pathMonitor = nil
         workspaceObservers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
         workspaceObservers.removeAll()
+        appObservers.forEach(NotificationCenter.default.removeObserver)
+        appObservers.removeAll()
+        pauseMonitoring()
         started = false
     }
 
@@ -171,43 +188,31 @@ final class NetworkMonitor {
 
     private func record(_ report: DiagnosticReport) {
         latestReport = report
-        context.insert(CheckRecord(report: report))
+        // 前回のチェックの後で監視が中断されていれば、その時刻をこの記録に残す（統計で中断中の時間を数えないため）
+        let pausedAt = monitoringPausedAt
+        setMonitoringPaused(at: nil)
+        context.insert(CheckRecord(report: report, monitoringPausedAt: pausedAt))
 
-        // 統計（StatisticsSummary.compute）と同じ方法で、障害中のチェックから次のチェックまでの時間を
-        // 停止時間として積み上げる。スリープ中やアプリが動いていなかった時間は上限までしか数えない。
-        if outageStart != nil, let previous = outageLastCheck {
-            let span = min(max(0, report.date.timeIntervalSince(previous)), StatisticsSummary.maximumSampleGap)
-            outageDowntime += span
-        }
-
-        if report.status == .offline {
-            let stage = report.failedStage ?? .web
-            outageLastCheck = report.date
-            if outageStart == nil {
-                outageStart = report.date
-                outageStage = stage
-                outageDowntime = 0
-                insertLog(.outage, report: report,
-                          headline: "インターネットに接続できなくなりました",
-                          message: "\(stage.title)で到達不能: \(report.diagnosis.headline)")
-                notify(title: "インターネットに接続できません", body: report.diagnosis.headline)
-            } else if outageStage != stage {
-                let previous = outageStage?.title ?? "不明"
-                outageStage = stage
-                insertLog(.causeChanged, report: report,
-                          headline: "原因の箇所が変わりました（\(previous) → \(stage.title)）",
-                          message: report.diagnosis.headline)
-            }
-        } else if outageStart != nil {
-            let downtime = outageDowntime
+        // 統計（StatisticsSummary.compute）と同じ規則で停止時間を積み上げる。中断中の時間は数えない
+        let event = outage.record(date: report.date, status: report.status, failedStage: report.failedStage,
+                                  monitoringPausedAt: pausedAt)
+        switch event {
+        case .began(let stage):
+            insertLog(.outage, report: report,
+                      headline: "インターネットに接続できなくなりました",
+                      message: "\(stage.title)で到達不能: \(report.diagnosis.headline)")
+            notify(title: "インターネットに接続できません", body: report.diagnosis.headline)
+        case .causeChanged(let previous, let stage):
+            insertLog(.causeChanged, report: report,
+                      headline: "原因の箇所が変わりました（\(previous?.title ?? "不明") → \(stage.title)）",
+                      message: report.diagnosis.headline)
+        case .restored(let downtime):
             insertLog(.restored, report: report,
                       headline: "インターネット接続が復旧しました",
                       message: "停止時間: \(downtime.durationText)", downtime: downtime)
             notify(title: "インターネット接続が復旧しました", body: "停止時間: \(downtime.durationText)")
-            outageStart = nil
-            outageStage = nil
-            outageDowntime = 0
-            outageLastCheck = nil
+        case nil:
+            break
         }
         persistOutageState()
         save()
@@ -231,15 +236,43 @@ final class NetworkMonitor {
 
     private func persistOutageState() {
         let defaults = UserDefaults.standard
-        if let outageStart {
-            defaults.set(outageStart, forKey: Self.outageStartKey)
-            defaults.set(outageStage?.rawValue, forKey: Self.outageStageKey)
-            defaults.set(outageDowntime, forKey: Self.outageDowntimeKey)
-            defaults.set(outageLastCheck, forKey: Self.outageLastCheckKey)
+        if let start = outage.start {
+            defaults.set(start, forKey: Self.outageStartKey)
+            defaults.set(outage.stage?.rawValue, forKey: Self.outageStageKey)
+            defaults.set(outage.downtime, forKey: Self.outageDowntimeKey)
+            defaults.set(outage.lastCheck, forKey: Self.outageLastCheckKey)
         } else {
             for key in [Self.outageStartKey, Self.outageStageKey, Self.outageDowntimeKey, Self.outageLastCheckKey] {
                 defaults.removeObject(forKey: key)
             }
+        }
+    }
+
+    /// 監視の中断（スリープ・終了）を記録する。次のチェックを記録するまでに何度中断しても、最初の時刻を残す。
+    private func pauseMonitoring() {
+        guard monitoringPausedAt == nil else { return }
+        setMonitoringPaused(at: .now)
+    }
+
+    private func setMonitoringPaused(at date: Date?) {
+        monitoringPausedAt = date
+        // 中断中に終了・異常終了しても次回の起動時に分かるよう保存しておく
+        if let date {
+            UserDefaults.standard.set(date, forKey: Self.monitoringPausedAtKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.monitoringPausedAtKey)
+        }
+    }
+
+    /// 保存されている最新のチェックの時刻。
+    private func latestRecordTimestamp() -> Date? {
+        var descriptor = FetchDescriptor<CheckRecord>(sortBy: [SortDescriptor(\.timestamp, order: .reverse)])
+        descriptor.fetchLimit = 1
+        do {
+            return try context.fetch(descriptor).first?.timestamp
+        } catch {
+            logger.error("Failed to fetch the latest record: \(error.localizedDescription, privacy: .public)")
+            return nil
         }
     }
 
@@ -340,6 +373,8 @@ final class NetworkMonitor {
         pathChangeTask?.cancel()
         // スリープをまたいだチェックは通信がタイムアウトして障害と誤判定されるため、結果を破棄する
         invalidateInFlightCheck()
+        // スリープ中の時間は統計や停止時間に数えない
+        pauseMonitoring()
     }
 
     private func handleDidWake() {

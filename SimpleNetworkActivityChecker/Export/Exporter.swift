@@ -69,10 +69,11 @@ nonisolated enum ExportEncoder {
     static func samplesCSV(_ samples: [CheckSample]) -> Data {
         csv(
             header: ["timestamp", "status", "failed_stage", "trigger", "interface",
-                     "gateway_ms", "internet_ms", "dns_ms", "web_ms"],
+                     "gateway_ms", "internet_ms", "dns_ms", "web_ms", "monitoring_paused_at"],
             rows: samples.map {
                 [iso($0.timestamp), $0.status.rawValue, $0.failedStage?.rawValue, $0.trigger.rawValue, $0.interface,
-                 number($0.gatewayLatencyMs), number($0.internetLatencyMs), number($0.dnsLatencyMs), number($0.webLatencyMs)]
+                 number($0.gatewayLatencyMs), number($0.internetLatencyMs), number($0.dnsLatencyMs), number($0.webLatencyMs),
+                 $0.monitoringPausedAt.map(iso)]
             }
         )
     }

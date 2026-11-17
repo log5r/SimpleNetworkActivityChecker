@@ -15,8 +15,13 @@ nonisolated final class CheckRecord {
     var internetLatencyMs: Double?
     var dnsLatencyMs: Double?
     var webLatencyMs: Double?
+    /// 前回のチェックの後、このチェックまでの間に監視が中断された（スリープ・アプリの終了）時刻。
+    /// 中断以降の時間は統計で稼働・停止のどちらにも数えない。後から追加した省略可能な属性なので、
+    /// 既存のストアは自動の軽量マイグレーションで開ける（以前の記録では nil）。
+    var monitoringPausedAt: Date?
 
-    init(report: DiagnosticReport) {
+    init(report: DiagnosticReport, monitoringPausedAt: Date? = nil) {
+        self.monitoringPausedAt = monitoringPausedAt
         timestamp = report.date
         statusRaw = report.status.rawValue
         failedStageRaw = report.failedStage?.rawValue
@@ -38,7 +43,8 @@ nonisolated final class CheckRecord {
             gatewayLatencyMs: gatewayLatencyMs,
             internetLatencyMs: internetLatencyMs,
             dnsLatencyMs: dnsLatencyMs,
-            webLatencyMs: webLatencyMs
+            webLatencyMs: webLatencyMs,
+            monitoringPausedAt: monitoringPausedAt
         )
     }
 }
@@ -123,6 +129,8 @@ nonisolated struct CheckSample: Codable, Sendable, Hashable {
     var internetLatencyMs: Double?
     var dnsLatencyMs: Double?
     var webLatencyMs: Double?
+    /// 前回のチェックの後で監視が中断された時刻（`CheckRecord.monitoringPausedAt`）
+    var monitoringPausedAt: Date?
 }
 
 /// スレッド間で受け渡すためのログの値型。
