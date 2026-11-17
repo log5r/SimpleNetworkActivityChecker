@@ -324,7 +324,7 @@ nonisolated enum NetworkDiagnostician {
 
     /// 各ステージの結果から総合状態と「最初に到達不能になった箇所」を決める。
     /// 後段が成功している場合、前段の失敗は単にプローブに応答しないだけなので原因とはみなさない。
-    private static func evaluate(_ input: [StageResult]) -> (ConnectivityStatus, DiagnosticStage?, [StageResult]) {
+    static func evaluate(_ input: [StageResult]) -> (ConnectivityStatus, DiagnosticStage?, [StageResult]) {
         var stages = input
         func index(_ stage: DiagnosticStage) -> Int { stages.firstIndex { $0.stage == stage }! }
         func status(_ stage: DiagnosticStage) -> StageStatus { stages[index(stage)].status }
@@ -359,7 +359,13 @@ nonisolated enum NetworkDiagnostician {
             return (hasWarning ? .degraded : .online, nil, stages)
         }
 
-        let failed: DiagnosticStage = if status(.gateway) == .failed, !reachable(.internet) {
+        // ログイン画面（キャプティブポータル）は認証前の通信をまとめて遮断するため、ルーターや
+        // インターネットへの確認も失敗する。検出できた場合はそちらを原因として優先する。
+        let captivePortal = stages[index(.web)].flags.contains(.captivePortal)
+
+        let failed: DiagnosticStage = if captivePortal {
+            .web
+        } else if status(.gateway) == .failed, !reachable(.internet) {
             .gateway
         } else if status(.internet) == .failed {
             .internet
@@ -373,7 +379,7 @@ nonisolated enum NetworkDiagnostician {
 
     // MARK: - Diagnosis
 
-    private static func makeDiagnosis(status: ConnectivityStatus, failedStage: DiagnosticStage?,
+    static func makeDiagnosis(status: ConnectivityStatus, failedStage: DiagnosticStage?,
                                       stages: [StageResult], snapshot: NetworkSnapshot) -> Diagnosis {
         let flags = Set(stages.flatMap(\.flags))
         let interface = snapshot.interfaceLabel

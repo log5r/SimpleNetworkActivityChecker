@@ -41,12 +41,11 @@ nonisolated struct Outage: Identifiable, Sendable, Codable, Hashable {
     var end: Date?
     var stage: DiagnosticStage
     var failedChecks: Int
+    /// 実際に計測できた停止時間。スリープ中やアプリが動いていなかった時間は
+    /// `StatisticsSummary.maximumSampleGap` までしか数えないため、`end - start` より短くなることがある。
+    var downtime: TimeInterval = 0
 
     var id: Date { start }
-
-    func duration(now: Date = .now) -> TimeInterval {
-        (end ?? now).timeIntervalSince(start)
-    }
 }
 
 nonisolated struct StatisticsBucket: Identifiable, Sendable, Hashable {
@@ -108,10 +107,12 @@ nonisolated struct StatisticsSummary: Sendable {
     var web = LatencySummary([])
 
     var availability: Double? { measuredSeconds > 0 ? upSeconds / measuredSeconds : nil }
-    var totalDowntime: TimeInterval { outages.reduce(0) { $0 + $1.duration(now: rangeEnd) } }
-    var longestOutage: Outage? { outages.max { $0.duration(now: rangeEnd) < $1.duration(now: rangeEnd) } }
+    /// 合計停止時間（計測時間のうち停止していた分。計測時間を超えることはない）
+    var totalDowntime: TimeInterval { outages.reduce(0) { $0 + $1.downtime } }
+    var longestOutage: Outage? { outages.max { $0.downtime < $1.downtime } }
 
-    /// アプリが動いていなかった時間を稼働・停止のどちらにも数えないための上限
+    /// アプリが動いていなかった時間（スリープ中・終了中）を稼働・停止のどちらにも数えないための上限。
+    /// 障害の停止時間（NetworkMonitor の復旧ログ・通知）もこの上限で同じように数える。
     static let maximumSampleGap: TimeInterval = 15 * 60
 
     static func compute(samples: [CheckSample], period: StatisticsPeriod, now: Date, calendar: Calendar = .current) -> StatisticsSummary {
@@ -152,12 +153,13 @@ nonisolated struct StatisticsSummary: Sendable {
             bucketMap[bucketStart] = bucket
             latencyLists[bucketStart] = lists
 
-            // 連続した失敗を 1 回の障害としてまとめる
+            // 連続した失敗を 1 回の障害としてまとめる（停止時間は稼働率と同じく計測できた時間だけを数える）
             if sample.status == .offline {
                 if currentOutage == nil {
                     currentOutage = Outage(start: sample.timestamp, end: nil, stage: sample.failedStage ?? .web, failedChecks: 0)
                 }
                 currentOutage?.failedChecks += 1
+                currentOutage?.downtime += span
             } else if var outage = currentOutage {
                 outage.end = sample.timestamp
                 summary.outages.append(outage)
@@ -187,7 +189,7 @@ nonisolated struct StatisticsSummary: Sendable {
         for outage in summary.outages {
             var cause = causeMap[outage.stage] ?? CauseStatistic(stage: outage.stage, outageCount: 0, downtime: 0)
             cause.outageCount += 1
-            cause.downtime += outage.duration(now: now)
+            cause.downtime += outage.downtime
             causeMap[outage.stage] = cause
         }
         summary.causes = DiagnosticStage.allCases.compactMap { causeMap[$0] }

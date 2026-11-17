@@ -150,7 +150,13 @@ actor DataStore {
             descriptor = FetchDescriptor(predicate: #Predicate { $0.timestamp <= end },
                                          sortBy: [SortDescriptor(\.timestamp)])
         }
-        return try modelContext.fetch(descriptor).map(\.sample)
+        // 件数が多くてもメモリを使い切らないよう分割して読み込み、キャンセルされたら途中でやめる
+        var samples: [CheckSample] = []
+        try modelContext.enumerate(descriptor, batchSize: 5_000) { record in
+            if samples.count % 5_000 == 0 { try Task.checkCancellation() }
+            samples.append(record.sample)
+        }
+        return samples
     }
 
     func prune(olderThan cutoff: Date) throws {

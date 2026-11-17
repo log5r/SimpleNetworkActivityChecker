@@ -12,6 +12,8 @@ struct SettingsView: View {
     @State private var loginItemNote: String?
     @State private var isConfirmingStatisticsDeletion = false
     @State private var isConfirmingLogDeletion = false
+    /// 確認待ちの（短くする）保存期間
+    @State private var pendingRetentionDays: Int?
 
     var body: some View {
         Form {
@@ -43,7 +45,7 @@ struct SettingsView: View {
             }
 
             Section("データ") {
-                Picker("記録の保存期間", selection: $retentionDays) {
+                Picker("記録の保存期間", selection: Binding(get: { retentionDays }, set: requestRetentionChange)) {
                     ForEach(AppSettings.retentionOptions, id: \.0) { value, label in
                         Text(label).tag(value)
                     }
@@ -60,11 +62,19 @@ struct SettingsView: View {
         .frame(width: 500)
         .fixedSize(horizontal: false, vertical: true)
         .onChange(of: checkInterval) { monitor.reschedule() }
-        .onChange(of: retentionDays) { monitor.applyRetentionPolicy() }
         .onChange(of: notificationsEnabled) { _, enabled in
             if enabled { monitor.requestNotificationAuthorization() }
         }
         .onAppear(perform: refreshLoginItemState)
+        .confirmationDialog("記録の保存期間を「\(retentionLabel(pendingRetentionDays))」に変更しますか？",
+                            isPresented: Binding(get: { pendingRetentionDays != nil },
+                                                 set: { if !$0 { pendingRetentionDays = nil } }),
+                            presenting: pendingRetentionDays) { days in
+            Button("変更して古い記録を削除", role: .destructive) { applyRetention(days) }
+            // キャンセルした場合は保存期間を変更しない（ピッカーは元の値のまま）
+        } message: { _ in
+            Text("保存期間を過ぎたチェック履歴とエラーログはすぐに削除されます。この操作は取り消せません。")
+        }
         .confirmationDialog("すべての統計データを削除しますか？", isPresented: $isConfirmingStatisticsDeletion) {
             Button("削除", role: .destructive) {
                 perform("統計データを削除できませんでした") { try monitor.deleteAllStatistics() }
@@ -79,6 +89,33 @@ struct SettingsView: View {
         } message: {
             Text("この操作は取り消せません。")
         }
+    }
+
+    /// 保存期間を短くすると古い記録が削除されるので確認してから変更する。長くする場合は何も削除されないのでそのまま変更する。
+    private func requestRetentionChange(_ newValue: Int) {
+        guard newValue != retentionDays else { return }
+        // 0 は無期限
+        let isShorter = newValue != 0 && (retentionDays == 0 || newValue < retentionDays)
+        if isShorter {
+            pendingRetentionDays = newValue
+        } else {
+            retentionDays = newValue
+        }
+    }
+
+    private func applyRetention(_ days: Int) {
+        retentionDays = days
+        Task {
+            do {
+                try await monitor.applyRetentionPolicy()
+            } catch {
+                Exporter.presentError(error, message: "保存期間を過ぎた記録を削除できませんでした")
+            }
+        }
+    }
+
+    private func retentionLabel(_ days: Int?) -> String {
+        AppSettings.retentionOptions.first { $0.0 == days }?.1 ?? ""
     }
 
     private func perform(_ failureMessage: String, _ action: () throws -> Void) {

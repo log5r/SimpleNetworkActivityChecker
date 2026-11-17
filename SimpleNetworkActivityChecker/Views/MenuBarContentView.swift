@@ -50,23 +50,24 @@ struct MenuBarContentView: View {
 
             Divider()
 
-            VStack(spacing: 0) {
-                MenuRow(title: "今すぐチェック", systemImage: "arrow.clockwise", shortcut: "⌘R") {
-                    monitor.checkNow()
-                }
-                .disabled(monitor.isChecking)
-                MenuRow(title: "ウインドウを開く", systemImage: "macwindow") {
-                    showMainWindow()
-                }
-                MenuRow(title: "設定…", systemImage: "gearshape", shortcut: "⌘,") {
+            // 標準のボタン。キーボードショートカットはパネル表示中に有効になる
+            HStack(spacing: 8) {
+                Button("今すぐチェック") { monitor.checkNow() }
+                    .keyboardShortcut("r")
+                    .disabled(monitor.isChecking)
+                Button("ウインドウを開く") { showMainWindow() }
+                Spacer(minLength: 0)
+                Button("設定…", systemImage: "gearshape") {
                     NSApp.activate()
                     openSettings()
                 }
-                Divider().padding(.vertical, 4)
-                MenuRow(title: "終了", systemImage: "power", shortcut: "⌘Q") {
-                    NSApp.terminate(nil)
-                }
+                .keyboardShortcut(",")
+                .help("設定…")
+                Button("終了", systemImage: "power") { NSApp.terminate(nil) }
+                    .keyboardShortcut("q")
+                    .help("終了")
             }
+            .labelStyle(.iconOnly)
         }
         .padding(14)
         .frame(width: 340)
@@ -83,35 +84,5 @@ struct MenuBarContentView: View {
         NSApp.setActivationPolicy(.regular)
         openWindow(id: MainWindow.id)
         NSApp.activate()
-    }
-}
-
-/// メニュー項目風のボタン（ホバーで強調表示）。
-private struct MenuRow: View {
-    var title: String
-    var systemImage: String
-    var shortcut: String?
-    var action: () -> Void
-
-    @State private var isHovering = false
-    @Environment(\.isEnabled) private var isEnabled
-
-    var body: some View {
-        Button(action: action) {
-            HStack {
-                Label(title, systemImage: systemImage)
-                Spacer()
-                if let shortcut {
-                    Text(shortcut).foregroundStyle(isHovering && isEnabled ? Color.white.opacity(0.8) : .secondary)
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .foregroundStyle(isHovering && isEnabled ? Color.white : .primary)
-            .background(isHovering && isEnabled ? Color.accentColor : .clear, in: RoundedRectangle(cornerRadius: 5))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
     }
 }

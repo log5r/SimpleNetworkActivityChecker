@@ -106,8 +106,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateActivationPolicy(excluding closing: NSWindow?) {
         guard !AppSettings.showDockIconWhenClosed else { return }
-        let hasVisibleWindow = NSApp.windows.contains { $0 !== closing && $0.isVisible && isRegularWindow($0) }
-        if !hasVisibleWindow {
+        // Dock にしまわれた（最小化された）ウインドウは isVisible が false になるが、Dock アイコンが必要なので数える
+        let hasOpenWindow = NSApp.windows.contains {
+            $0 !== closing && ($0.isVisible || $0.isMiniaturized) && isRegularWindow($0)
+        }
+        if !hasOpenWindow {
             NSApp.setActivationPolicy(.accessory)
         }
     }

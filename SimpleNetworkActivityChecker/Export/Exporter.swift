@@ -77,11 +77,11 @@ nonisolated enum ExportEncoder {
         )
     }
 
-    static func outagesCSV(_ outages: [Outage], now: Date) -> Data {
+    static func outagesCSV(_ outages: [Outage]) -> Data {
         csv(
-            header: ["start", "end", "duration_seconds", "failed_stage", "failed_checks"],
+            header: ["start", "end", "downtime_seconds", "failed_stage", "failed_checks"],
             rows: outages.map {
-                [iso($0.start), $0.end.map(iso), String(Int($0.duration(now: now))), $0.stage.rawValue, String($0.failedChecks)]
+                [iso($0.start), $0.end.map(iso), String(Int($0.downtime)), $0.stage.rawValue, String($0.failedChecks)]
             }
         )
     }
@@ -89,7 +89,7 @@ nonisolated enum ExportEncoder {
     private struct StatisticsDocument: Encodable {
         struct Latency: Encodable { var averageMs: Double?; var p95Ms: Double?; var maxMs: Double? }
         struct Cause: Encodable { var stage: String; var outageCount: Int; var downtimeSeconds: Double }
-        struct OutageEntry: Encodable { var start: Date; var end: Date?; var durationSeconds: Double; var failedStage: String; var failedChecks: Int }
+        struct OutageEntry: Encodable { var start: Date; var end: Date?; var downtimeSeconds: Double; var failedStage: String; var failedChecks: Int }
 
         var exportedAt: Date
         var period: String
@@ -128,7 +128,7 @@ nonisolated enum ExportEncoder {
                       "dns": latency(summary.dns), "web": latency(summary.web)],
             causes: summary.causes.map { .init(stage: $0.stage.rawValue, outageCount: $0.outageCount, downtimeSeconds: $0.downtime) },
             outages: summary.outages.map {
-                .init(start: $0.start, end: $0.end, durationSeconds: $0.duration(now: summary.rangeEnd),
+                .init(start: $0.start, end: $0.end, downtimeSeconds: $0.downtime,
                       failedStage: $0.stage.rawValue, failedChecks: $0.failedChecks)
             },
             samples: samples
@@ -200,9 +200,17 @@ enum Exporter {
         }
     }
 
-    static func timestampedName(_ base: String) -> String {
+    /// ファイル名用の固定書式。ユーザーの暦法（和暦など）や地域設定に左右されないよう POSIX ロケールとグレゴリオ暦を指定する。
+    private static let fileNameFormatter: DateFormatter = {
         let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
         formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return "\(base)-\(formatter.string(from: .now))"
+        return formatter
+    }()
+
+    static func timestampedName(_ base: String, date: Date = .now) -> String {
+        "\(base)-\(fileNameFormatter.string(from: date))"
     }
 }

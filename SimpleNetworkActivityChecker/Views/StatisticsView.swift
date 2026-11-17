@@ -8,12 +8,22 @@ struct StatisticsView: View {
     @AppStorage("statisticsPeriod") private var period: StatisticsPeriod = .day
     @State private var summary: StatisticsSummary?
     @State private var samples: [CheckSample] = []
-    @State private var isLoading = false
     @State private var loadError: String?
+    /// 最後に読み込みを終えた時刻（記録の追加による再読み込みの間隔を空けるために使う）
+    @State private var lastLoaded: Date?
 
     private struct LoadKey: Equatable {
         var period: StatisticsPeriod
         var version: Int
+    }
+
+    /// 記録が追加されたときに再読み込みする最短の間隔（秒）。期間が長いほど読み込みが重いので間隔を空ける。
+    private var reloadInterval: TimeInterval {
+        switch period {
+        case .day: 5
+        case .week: 15
+        case .month, .all: 60
+        }
     }
 
     var body: some View {
@@ -26,9 +36,9 @@ struct StatisticsView: View {
                 } actions: {
                     Button("再試行") { Task { await load() } }
                 }
-            } else if let summary, summary.checkCount > 0 {
+            } else if let summary, summary.period == period, summary.checkCount > 0 {
                 content(summary)
-            } else if summary != nil {
+            } else if let summary, summary.period == period {
                 ContentUnavailableView("この期間のデータはありません", systemImage: "chart.bar",
                                        description: Text("アプリが起動している間、接続状態が定期的に記録されます。"))
             } else {
@@ -53,33 +63,54 @@ struct StatisticsView: View {
                 } label: {
                     Label("書き出す", systemImage: "square.and.arrow.up")
                 }
-                .disabled(samples.isEmpty)
+                .disabled(samples.isEmpty || summary?.period != period)
                 .help("統計データをファイルに書き出します")
             }
         }
         .task(id: LoadKey(period: period, version: monitor.dataVersion)) {
-            await load()
+            await reload()
         }
     }
 
+    /// 期間を切り替えたときはすぐに、記録が追加されたときは間隔を空けてから読み込み直す。
+    /// 待っている間に次の記録が追加されると .task(id:) が作り直され、この待機はキャンセルされる。
+    private func reload() async {
+        if summary?.period == period, loadError == nil, let lastLoaded {
+            let wait = reloadInterval - Date().timeIntervalSince(lastLoaded)
+            if wait > 0 {
+                do { try await Task.sleep(for: .seconds(wait)) } catch { return }
+            }
+        }
+        await load()
+    }
+
     private func load() async {
-        isLoading = true
-        defer { isLoading = false }
         let period = period
         let now = Date()
         let container = monitor.container
+        // メインスレッドを塞がないよう、別スレッドのコンテキストで読み込んで集計する
+        let work = Task.detached(priority: .userInitiated) {
+            let store = DataStore(modelContainer: container)
+            let samples = try await store.samples(from: period.startDate(relativeTo: now), to: now)
+            try Task.checkCancellation()
+            return (samples, StatisticsSummary.compute(samples: samples, period: period, now: now))
+        }
         do {
-            // メインスレッドを塞がないよう、別スレッドのコンテキストで読み込んで集計する
-            let result = try await Task.detached(priority: .userInitiated) {
-                let store = DataStore(modelContainer: container)
-                let samples = try await store.samples(from: period.startDate(relativeTo: now), to: now)
-                return (samples, StatisticsSummary.compute(samples: samples, period: period, now: now))
-            }.value
+            // 画面の再読み込みでこのタスクがキャンセルされたら、読み込み処理にも伝えて重複して動かないようにする
+            let result = try await withTaskCancellationHandler {
+                try await work.value
+            } onCancel: {
+                work.cancel()
+            }
             guard !Task.isCancelled else { return }
             samples = result.0
             summary = result.1
             loadError = nil
+            lastLoaded = .now
+        } catch is CancellationError {
+            return
         } catch {
+            guard !Task.isCancelled else { return }
             loadError = error.localizedDescription
         }
     }
@@ -104,8 +135,8 @@ struct StatisticsView: View {
                         LatencyTable(summary: summary)
                     }
                 }
-                ChartSection(title: "障害の履歴", subtitle: "インターネットに接続できなかった期間") {
-                    OutageList(outages: summary.outages.reversed(), now: summary.rangeEnd)
+                ChartSection(title: "障害の履歴", subtitle: "インターネットに接続できなかった期間（停止時間は計測できた時間のみ）") {
+                    OutageList(outages: summary.outages.reversed())
                 }
             }
             .padding(20)
@@ -122,7 +153,7 @@ struct StatisticsView: View {
                      detail: "失敗したチェック \(summary.failedCheckCount) 回",
                      color: summary.outages.isEmpty ? .green : .red)
             StatTile(title: "合計停止時間", value: summary.totalDowntime.durationText,
-                     detail: summary.longestOutage.map { "最長 \($0.duration(now: summary.rangeEnd).durationText)" } ?? "障害なし",
+                     detail: summary.longestOutage.map { "最長 \($0.downtime.durationText)" } ?? "障害なし",
                      color: summary.totalDowntime > 0 ? .red : .green)
             StatTile(title: "インターネット応答", value: summary.internet.average.map { String(format: "%.0f ms", $0) } ?? "—",
                      detail: "平均（TCP 接続時間）", color: .accentColor)
@@ -148,10 +179,9 @@ struct StatisticsView: View {
     private func exportOutagesCSV() {
         guard let summary else { return }
         let outages = summary.outages
-        let now = summary.rangeEnd
         Task {
             await Exporter.export(suggestedName: Exporter.timestampedName("\(exportBaseName)-outages"), format: .csv) {
-                ExportEncoder.outagesCSV(outages, now: now)
+                ExportEncoder.outagesCSV(outages)
             }
         }
     }
@@ -329,7 +359,6 @@ private struct LatencyTable: View {
 
 private struct OutageList: View {
     var outages: [Outage]
-    var now: Date
 
     var body: some View {
         if outages.isEmpty {
@@ -346,7 +375,7 @@ private struct OutageList: View {
                         Text("継続中").foregroundStyle(.red)
                     }
                 }
-                TableColumn("停止時間") { Text($0.duration(now: now).durationText).monospacedDigit() }
+                TableColumn("停止時間") { Text($0.downtime.durationText).monospacedDigit() }
                 TableColumn("途切れた箇所") { outage in
                     Label(outage.stage.title, systemImage: outage.stage.symbolName)
                 }

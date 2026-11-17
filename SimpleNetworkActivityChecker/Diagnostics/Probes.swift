@@ -351,12 +351,6 @@ nonisolated enum HTTPOutcome: Sendable {
     case success(latencyMs: Double)
     case unexpectedResponse(statusCode: Int, latencyMs: Double)
     case failed(code: URLError.Code?, message: String)
-
-    var isTLSFailure: Bool {
-        guard case .failed(let code?, _) = self else { return false }
-        return [.serverCertificateUntrusted, .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
-                .serverCertificateNotYetValid, .secureConnectionFailed, .clientCertificateRejected].contains(code)
-    }
 }
 
 nonisolated enum CaptivePortalOutcome: Sendable {
