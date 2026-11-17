@@ -57,3 +57,6 @@ build/
 .build/
 tmp/
 local/
+
+# Local signing settings loaded by start.sh
+/Config/Signing.local.xcconfig
